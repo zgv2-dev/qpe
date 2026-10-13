@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=QPE
+Comment=Trim and crop videos
+Exec=qpe %f
+Icon=qpe
+Categories=AudioVideo;Video;
+MimeType=video/mp4;video/x-matroska;

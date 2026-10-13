@@ -1,0 +1,112 @@
+name: CI
+
+# Every push and PR: build, test and package for macOS, Windows and Linux.
+# Tags like v1.2.3: also publish the packages as a GitHub release.
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'dev' }}
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install mpv dylibbundler
+      - run: cargo test
+      - run: scripts/package-macos.sh "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.dmg
+
+  linux:
+    # mpv >= 0.35 (libmpv.so.2) is needed, so 24.04 is the oldest usable Ubuntu.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libmpv-dev ffmpeg libxkbcommon-dev libfuse2
+      - run: cargo test
+      - run: cargo build --release
+      - name: Package AppImage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        run: |
+          mkdir -p AppDir/usr/bin dist
+          cp target/release/qpe AppDir/usr/bin/
+          # Static ffmpeg, so the AppImage doesn't depend on the distro's.
+          gh release download latest -R BtbN/FFmpeg-Builds -p 'ffmpeg-master-latest-linux64-gpl.tar.xz'
+          tar xf ffmpeg-master-latest-linux64-gpl.tar.xz
+          cp ffmpeg-master-latest-linux64-gpl/bin/ffmpeg AppDir/usr/bin/
+          curl -fsSLo linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy
+          mkdir icon && ffmpeg -v error -i assets/qpe.png -vf scale=256:256 icon/qpe.png
+          ./linuxdeploy --appdir AppDir -e AppDir/usr/bin/qpe -d assets/qpe.desktop -i icon/qpe.png --output appimage
+          mv QPE*.AppImage "dist/QPE-$VERSION-linux-x86_64.AppImage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*.AppImage
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Fetch libmpv and ffmpeg
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download -R shinchiro/mpv-winbuild-cmake -p 'mpv-dev-x86_64-2*.7z' -O mpv.7z
+          7z x mpv.7z -ompv | Out-Null
+          # MSVC needs an import library; build mpv.lib from the DLL's exports.
+          $exports = dumpbin /exports mpv/libmpv-2.dll | ForEach-Object { if ($_ -match '\s(mpv_\w+)$') { $Matches[1] } }
+          Set-Content mpv/mpv.def (@('EXPORTS') + $exports)
+          lib /nologo /def:mpv/mpv.def /name:libmpv-2.dll /out:mpv/mpv.lib /machine:x64
+          gh release download latest -R BtbN/FFmpeg-Builds -p 'ffmpeg-master-latest-win64-gpl.zip' -O ffmpeg.zip
+          7z x ffmpeg.zip | Out-Null
+          "MPV_LIB_DIR=$PWD\mpv" >> $env:GITHUB_ENV
+          "$PWD\mpv" >> $env:GITHUB_PATH
+          "$PWD\ffmpeg-master-latest-win64-gpl\bin" >> $env:GITHUB_PATH
+      - run: cargo test
+      - run: cargo build --release
+      - name: Package zip
+        run: |
+          New-Item -ItemType Directory -Force QPE, dist | Out-Null
+          Copy-Item target/release/qpe.exe, mpv/libmpv-2.dll, ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe QPE/
+          Compress-Archive QPE/* "dist/QPE-$env:VERSION-windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes
