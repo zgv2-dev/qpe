@@ -27,11 +27,16 @@ const HEVC: &[&str] = &[
     "hevc_mf",
 ];
 
-/// `ffmpeg` bundled next to our executable, else the one on PATH.
+/// `ffmpeg` bundled with QPE, else the one on PATH.
 fn command(name: &str) -> Command {
-    let bundled = std::env::current_exe()
-        .map(|p| p.with_file_name(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
+    #[cfg(bundled)]
+    let dir = Some(crate::bundle::dir());
+    #[cfg(not(bundled))]
+    let dir = std::env::current_exe()
         .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let bundled = dir
+        .map(|d| d.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
         .filter(|p| p.is_file());
     let mut cmd = Command::new(bundled.as_deref().unwrap_or(Path::new(name)));
     cmd.stdin(Stdio::null());
@@ -51,7 +56,16 @@ pub struct Job {
     pub precise: bool,
     /// Source video codec as named by ffmpeg (`h264`, `hevc`, ...).
     pub codec: String,
+    /// Index into [`QUALITIES`]. Anything below the best re-encodes.
+    pub quality: usize,
+    /// Drop all audio tracks.
+    pub mute: bool,
 }
+
+/// Export containers, by file extension.
+pub const FORMATS: &[&str] = &["mp4", "mov", "mkv"];
+/// Quality levels, best first. Only the best one may stream-copy.
+pub const QUALITIES: &[&str] = &["High", "Medium", "Low"];
 
 pub enum Msg {
     Progress(f32),
@@ -85,17 +99,22 @@ pub fn candidates(codec: &str, available: &str) -> Vec<&'static str> {
         .collect()
 }
 
-fn quality(enc: &str) -> &'static [&'static str] {
+/// Encoder settings for `level`, an index into [`QUALITIES`].
+fn quality(enc: &str, level: usize) -> Vec<String> {
+    let q = |v: [u32; 3]| v[level.min(2)];
     match enc.rsplit('_').next().unwrap_or(enc) {
-        "videotoolbox" => &["-q:v", "65"],
-        "nvenc" => &["-rc", "vbr", "-cq", "23", "-b:v", "0"],
-        "qsv" => &["-global_quality", "23"],
-        "amf" => &["-rc", "cqp", "-qp_i", "22", "-qp_p", "22"],
-        "libx264" => &["-crf", "20", "-preset", "medium"],
-        "libx265" => &["-crf", "22", "-preset", "medium"],
+        "videotoolbox" => format!("-q:v {}", q([65, 50, 35])),
+        "nvenc" => format!("-rc vbr -cq {} -b:v 0", q([23, 28, 33])),
+        "qsv" => format!("-global_quality {}", q([23, 28, 33])),
+        "amf" => format!("-rc cqp -qp_i {0} -qp_p {0}", q([22, 28, 34])),
+        "libx264" => format!("-crf {} -preset medium", q([20, 24, 28])),
+        "libx265" => format!("-crf {} -preset medium", q([22, 26, 30])),
         // shortcut: fixed bitrate for encoders without a quality mode, revisit if output looks soft.
-        _ => &["-b:v", "12M"],
+        _ => format!("-b:v {}M", q([12, 6, 3])),
     }
+    .split(' ')
+    .map(String::from)
+    .collect()
 }
 
 /// ffmpeg arguments for `job`. `enc = None` means lossless stream copy.
@@ -134,15 +153,24 @@ pub fn args(job: &Job, enc: Option<&str>) -> Vec<String> {
             a.extend(s(&[
                 "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?", "-c", "copy", "-c:v", enc,
             ]));
-            a.extend(s(quality(enc)));
+            a.extend(quality(enc, job.quality));
             if let Some([w, h, x, y]) = job.crop {
                 a.extend(["-vf".into(), format!("crop={w}:{h}:{x}:{y}")]);
             }
-            let ext = job.dst.extension().unwrap_or_default().to_ascii_lowercase();
-            if HEVC.contains(&enc) && ext != "mkv" {
-                a.extend(s(&["-tag:v", "hvc1"])); // so QuickTime/Apple players open HEVC MP4s
-            }
         }
+    }
+    if job.mute {
+        a.push("-an".into());
+    }
+    let mkv = |p: &Path| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mkv"));
+    // Subtitles and attachments don't carry across containers: MP4/MOV only take mov_text, MKV can't.
+    match (mkv(&job.src), mkv(&job.dst)) {
+        (true, false) => a.extend(s(&["-map", "-0:t", "-c:s", "mov_text"])),
+        (false, true) => a.extend(s(&["-c:s", "srt"])),
+        _ => {}
+    }
+    if enc.map_or(job.codec == "hevc", |e| HEVC.contains(&e)) && !mkv(&job.dst) {
+        a.extend(s(&["-tag:v", "hvc1"])); // so QuickTime/Apple players open HEVC MP4s
     }
     a.push(job.dst.to_string_lossy().into_owned());
     a
@@ -167,18 +195,20 @@ pub fn export(job: Job, ctx: Context) -> Running {
 
 fn run(job: &Job, tx: &Sender<Msg>, stop: &AtomicBool, ctx: &Context) -> Result<(), String> {
     static ENCODERS: OnceLock<String> = OnceLock::new();
-    let encs: Vec<Option<&str>> = if job.crop.is_none() && !job.precise {
-        vec![None]
-    } else {
-        let list = ENCODERS.get_or_init(|| {
-            command("ffmpeg")
-                .args(["-hide_banner", "-encoders"])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                .unwrap_or_default()
-        });
-        candidates(&job.codec, list).into_iter().map(Some).collect()
-    };
+    let copy = job.crop.is_none() && !job.precise && job.quality == 0;
+    let list = ENCODERS.get_or_init(|| {
+        command("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    });
+    // Copy when allowed. Re-encode if it fails, e.g. a codec the new container can't hold.
+    let encs: Vec<Option<&str>> = copy
+        .then_some(None)
+        .into_iter()
+        .chain(candidates(&job.codec, list).into_iter().map(Some))
+        .collect();
     if encs.is_empty() {
         return Err("ffmpeg has no H.264/HEVC encoder (or ffmpeg was not found).".into());
     }
@@ -285,6 +315,8 @@ mod tests {
             crop,
             precise: false,
             codec: "hevc".into(),
+            quality: 0,
+            mute: false,
         }
     }
 
@@ -306,6 +338,13 @@ mod tests {
             "{a}"
         );
         assert!(a.ends_with(" out.mkv"));
+        let mut j = job(None, "out.mp4");
+        j.mute = true;
+        let a = args(&j, None).join(" ");
+        assert!(
+            a.ends_with("-an -map -0:t -c:s mov_text -tag:v hvc1 out.mp4"),
+            "{a}"
+        );
     }
 
     #[test]
@@ -316,7 +355,15 @@ mod tests {
         )
         .join(" ");
         assert!(
-            a.contains("-c:v hevc_videotoolbox -q:v 65 -vf crop=640:360:2:4 -tag:v hvc1 out.mp4"),
+            a.contains("-c:v hevc_videotoolbox -q:v 65 -vf crop=640:360:2:4 -map -0:t"),
+            "{a}"
+        );
+        assert!(a.ends_with("-tag:v hvc1 out.mp4"), "{a}");
+        let mut j = job(None, "out.mkv");
+        j.quality = 2;
+        let a = args(&j, Some("libx264")).join(" ");
+        assert!(
+            a.contains("-c:v libx264 -crf 28 -preset medium out.mkv"),
             "{a}"
         );
         let a = args(
@@ -374,6 +421,8 @@ mod tests {
                 crop,
                 precise: false,
                 codec: "h264".into(),
+                quality: 0,
+                mute: false,
             };
             let run = export(job, Context::default());
             let res = loop {

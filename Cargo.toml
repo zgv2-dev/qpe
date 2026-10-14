@@ -1,6 +1,6 @@
 [package]
 name = "qpe"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -8,3 +8,16 @@ eframe = { version = "0.36", default-features = false, features = ["glow", "defa
 egui-phosphor = "0.14"
 libmpv2 = "6"
 rfd = "0.17"
+
+[target.'cfg(windows)'.dependencies]
+flate2 = "1"
+
+[build-dependencies]
+flate2 = "1"
+
+# build.rs deflates ~300 MB on Windows; unoptimized miniz takes minutes.
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.release.package.miniz_oxide]
+opt-level = 3

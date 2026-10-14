@@ -20,6 +20,8 @@ const THUMB: [usize; 2] = [96, 72];
 const MIN_LEN: f64 = 0.1;
 /// Trim handle width, in points.
 const HANDLE: f32 = 12.0;
+/// Filmstrip height, in points.
+const TRIM_H: f32 = 44.0;
 
 #[derive(Clone, Copy)]
 enum Drag {
@@ -50,6 +52,10 @@ pub struct App {
     crop: Option<Rect>,
     preset: usize,
     precise: bool,
+    /// Indexes into [`ffmpeg::FORMATS`] and [`ffmpeg::QUALITIES`].
+    format: usize,
+    quality: usize,
+    mute: bool,
     drag: Option<Drag>,
     /// Offset from the pointer to the grabbed handle, so it doesn't jump to the pointer.
     grab: Vec2,
@@ -96,6 +102,9 @@ impl App {
             crop: None,
             preset: 0,
             precise: false,
+            format: 0,
+            quality: 0,
+            mute: false,
             drag: None,
             grab: Vec2::ZERO,
             thumbs: Vec::new(),
@@ -117,10 +126,7 @@ impl App {
     }
 
     fn open_dialog(&mut self) {
-        if let Some(p) = rfd::FileDialog::new()
-            .add_filter("Video", &["mp4", "m4v", "mkv"])
-            .pick_file()
-        {
+        if let Some(p) = rfd::FileDialog::new().pick_file() {
             self.open(p);
         }
     }
@@ -153,6 +159,11 @@ impl App {
             .to_string_lossy()
             .into_owned();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — QPE")));
+        let ext = path.extension().unwrap_or_default();
+        self.format = ffmpeg::FORMATS
+            .iter()
+            .position(|f| ext.eq_ignore_ascii_case(f))
+            .unwrap_or(0);
 
         let (tx, rx) = channel();
         ffmpeg::thumbnails(path.clone(), dur, THUMBS, THUMB, tx, ctx.clone());
@@ -210,16 +221,11 @@ impl App {
         if self.job.is_some() {
             return;
         }
-        let ext = v
-            .path
-            .extension()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
+        let ext = ffmpeg::FORMATS[self.format];
         let stem = v.path.file_stem().unwrap_or_default().to_string_lossy();
         let mut dialog = rfd::FileDialog::new()
             .set_file_name(format!("{stem}-edited.{ext}"))
-            .add_filter(&ext, &[&ext]);
+            .add_filter(ext.to_uppercase(), &[ext]);
         if let Some(dir) = v.path.parent() {
             dialog = dialog.set_directory(dir);
         }
@@ -227,7 +233,7 @@ impl App {
             return;
         };
         if dst.extension().is_none() {
-            dst.set_extension(&ext);
+            dst.set_extension(ext);
         }
         if std::fs::canonicalize(&dst).ok() == std::fs::canonicalize(&v.path).ok() {
             self.status = Some((
@@ -249,6 +255,8 @@ impl App {
             crop,
             precise: self.precise,
             codec: v.codec.clone(),
+            quality: self.quality,
+            mute: self.mute,
         };
         self.job = Some(ffmpeg::export(job, ctx.clone()));
         self.progress = 0.0;
@@ -469,7 +477,6 @@ impl App {
             ui.label(RichText::new(icon::FILE_VIDEO).size(56.0).weak());
             ui.add_space(4.0);
             ui.label(RichText::new("Drop a video here").size(17.0).strong());
-            ui.label(RichText::new("MP4 or MKV").weak());
             ui.add_space(12.0);
             let shortcut = ui
                 .ctx()
@@ -655,7 +662,9 @@ impl App {
 
     fn bar(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
-        ui.horizontal(|ui| {
+        // Row as tall as the filmstrip, so everything centers on it.
+        let row = vec2(ui.available_width(), TRIM_H);
+        ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
             let (glyph, label) = if self.paused() {
                 (icon::PLAY, "Play (Space)")
             } else {
@@ -681,6 +690,20 @@ impl App {
                     if icon_button(ui, icon::EXPORT, "Export… (⌘S / Ctrl+S)", false).clicked() {
                         self.export(&ctx);
                     }
+                    egui::ComboBox::from_id_salt("format")
+                        .width(56.0)
+                        .selected_text(ffmpeg::FORMATS[self.format].to_uppercase())
+                        .show_index(ui, &mut self.format, ffmpeg::FORMATS.len(), |i| {
+                            ffmpeg::FORMATS[i].to_uppercase()
+                        })
+                        .on_hover_text("Export format");
+                    egui::ComboBox::from_id_salt("quality")
+                        .width(72.0)
+                        .selected_text(ffmpeg::QUALITIES[self.quality])
+                        .show_index(ui, &mut self.quality, ffmpeg::QUALITIES.len(), |i| {
+                            ffmpeg::QUALITIES[i]
+                        })
+                        .on_hover_text("Export quality. Medium and Low re-encode.");
                     if icon_button(
                         ui,
                         icon::TARGET,
@@ -690,6 +713,12 @@ impl App {
                     .clicked()
                     {
                         self.precise = !self.precise;
+                    }
+                    if icon_button(ui, icon::SPEAKER_SIMPLE_SLASH, "Remove audio", self.mute)
+                        .clicked()
+                    {
+                        self.mute = !self.mute;
+                        let _ = self.player.mpv.set_property("mute", self.mute);
                     }
                 }
                 ui.separator();
@@ -729,17 +758,19 @@ impl App {
         let dur = self.video.as_ref().map_or(0.0, |v| v.dur).max(0.001);
         let aspect = THUMB[0] as f32 / THUMB[1] as f32;
         let (r, resp) = ui.allocate_exact_size(
-            vec2(ui.available_width().max(60.0), 44.0),
+            vec2(ui.available_width().max(60.0), TRIM_H),
             Sense::click_and_drag(),
         );
-        let x = |t: f64| r.min.x + (t / dur) as f32 * r.width();
-        let t_at = |px: f32| ((px - r.min.x) / r.width()) as f64 * dur;
+        // Handles sit outside the kept range, so the strip leaves room for them at both ends.
+        let strip = r.shrink2(vec2(HANDLE, 0.0));
+        let x = |t: f64| strip.min.x + (t / dur) as f32 * strip.width();
+        let t_at = |px: f32| ((px - strip.min.x) / strip.width()) as f64 * dur;
         let (xi, xo) = (x(self.trim.0), x(self.trim.1));
         // Handle under `px`, nearest first. Zones are wider than the drawn handles.
         let hit = |px: f32| {
             let (di, dout) = (
-                (px - xi - HANDLE / 2.0).abs(),
-                (px - xo + HANDLE / 2.0).abs(),
+                (px - xi + HANDLE / 2.0).abs(),
+                (px - xo - HANDLE / 2.0).abs(),
             );
             if di < HANDLE * 1.5 && di <= dout {
                 Drag::In
@@ -793,11 +824,11 @@ impl App {
 
         let p = ui.painter_at(r);
         p.rect_filled(r, 6.0, Color32::from_gray(40));
-        let slot = r.width() / THUMBS as f32;
+        let slot = strip.width() / THUMBS as f32;
         for (i, tex) in self.thumbs.iter().enumerate() {
             let Some(tex) = tex else { continue };
             let sr = Rect::from_min_size(
-                pos2(r.min.x + i as f32 * slot, r.min.y),
+                pos2(strip.min.x + i as f32 * slot, r.min.y),
                 vec2(slot, r.height()),
             );
             // Center-crop the thumbnail to the slot's aspect.
@@ -809,16 +840,16 @@ impl App {
         p.rect_filled(Rect::from_min_max(r.min, pos2(xi, r.max.y)), 0.0, DIM);
         p.rect_filled(Rect::from_min_max(pos2(xo, r.min.y), r.max), 0.0, DIM);
 
-        let sel = Rect::from_x_y_ranges(xi..=xo, r.y_range());
+        let sel = Rect::from_x_y_ranges(xi - HANDLE..=xo + HANDLE, r.y_range());
         p.rect_stroke(sel, 4.0, Stroke::new(3.0, YELLOW), egui::StrokeKind::Inside);
         let font = FontId::proportional(13.0);
         for (hr, glyph) in [
             (
-                Rect::from_x_y_ranges(xi..=xi + HANDLE, r.y_range()),
+                Rect::from_x_y_ranges(xi - HANDLE..=xi, r.y_range()),
                 icon::CARET_LEFT,
             ),
             (
-                Rect::from_x_y_ranges(xo - HANDLE..=xo, r.y_range()),
+                Rect::from_x_y_ranges(xo..=xo + HANDLE, r.y_range()),
                 icon::CARET_RIGHT,
             ),
         ] {
