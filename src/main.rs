@@ -27,8 +27,8 @@ fn main() -> eframe::Result {
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/qpe.png"))
                     .expect("assets/qpe.png is a valid PNG"),
             )
-            .with_inner_size([960.0, 600.0])
-            .with_min_inner_size([520.0, 320.0])
+            .with_inner_size([1040.0, 620.0])
+            .with_min_inner_size([980.0, 320.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };

@@ -216,6 +216,11 @@ impl App {
         self.player.seek(self.trim.1);
     }
 
+    fn skip(&mut self, by: f64) {
+        let dur = self.video.as_ref().map_or(0.0, |v| v.dur);
+        self.player.seek((self.pos() + by).clamp(0.0, dur));
+    }
+
     fn export(&mut self, ctx: &egui::Context) {
         let Some(v) = &self.video else { return };
         if self.job.is_some() {
@@ -321,6 +326,10 @@ impl App {
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
             self.export(ctx);
+        }
+        // Typing in a time field: leave Space, arrows, I/O/C to the text edit.
+        if ctx.egui_wants_keyboard_input() {
+            return;
         }
         let key = |k| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
         if key(Key::Space) {
@@ -456,14 +465,48 @@ fn icon_button(ui: &mut Ui, glyph: &str, label: &str, selected: bool) -> Respons
     r.on_hover_text(label)
 }
 
+/// Editable time: drag to nudge, click to type. Returns true when the value changed.
+fn time_field(
+    ui: &mut Ui,
+    t: &mut f64,
+    max: f64,
+    prefix: impl Into<egui::WidgetText>,
+    hint: &str,
+) -> bool {
+    ui.add(
+        egui::DragValue::new(t)
+            .range(0.0..=max)
+            .speed(0.01)
+            .prefix(prefix.into())
+            .custom_formatter(|t, _| fmt_time(t))
+            .custom_parser(parse_time)
+            // Half-typed values like "1" would otherwise move the trim.
+            .update_while_editing(false),
+    )
+    .on_hover_text(hint)
+    .changed()
+}
+
 fn fmt_time(t: f64) -> String {
-    let t = t.max(0.0);
-    let (h, m, s) = ((t / 3600.0) as u64, (t / 60.0) as u64 % 60, t % 60.0);
+    let ms = (t.max(0.0) * 1000.0).round() as u64;
+    let (h, m, s, f) = (ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000);
     if h > 0 {
-        format!("{h}:{m:02}:{s:04.1}")
+        format!("{h}:{m:02}:{s:02}.{f:03}")
     } else {
-        format!("{m}:{s:04.1}")
+        format!("{m}:{s:02}.{f:03}")
     }
+}
+
+/// Seconds from "s", "m:s" or "h:m:s", each with optional decimals.
+fn parse_time(s: &str) -> Option<f64> {
+    let parts: Vec<_> = s.trim().split(':').collect();
+    if parts.len() > 3 {
+        return None;
+    }
+    let t = parts.iter().try_fold(0.0, |acc, p| {
+        Some(acc * 60.0 + p.trim().parse::<f64>().ok()?)
+    })?;
+    (t.is_finite() && t >= 0.0).then_some(t)
 }
 
 impl App {
@@ -662,8 +705,8 @@ impl App {
 
     fn bar(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
-        // Row as tall as the filmstrip, so everything centers on it.
-        let row = vec2(ui.available_width(), TRIM_H);
+        // Controls row above the full-width filmstrip.
+        let row = vec2(ui.available_width(), 30.0);
         ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
             let (glyph, label) = if self.paused() {
                 (icon::PLAY, "Play (Space)")
@@ -672,6 +715,27 @@ impl App {
             };
             if icon_button(ui, glyph, label, false).clicked() {
                 self.toggle_play();
+            }
+            if icon_button(ui, icon::CLOCK_COUNTER_CLOCKWISE, "Back 5 s", false).clicked() {
+                self.skip(-5.0);
+            }
+            if icon_button(ui, icon::CLOCK_CLOCKWISE, "Forward 5 s", false).clicked() {
+                self.skip(5.0);
+            }
+            ui.label(RichText::new(fmt_time(self.pos())).monospace().strong());
+            ui.separator();
+            let dur = self.video.as_ref().map_or(0.0, |v| v.dur);
+            let (mut a, mut b) = self.trim;
+            if time_field(ui, &mut a, dur, "In ", "Start. Type h:m:s.ms, or press I.") {
+                self.set_in(a);
+            }
+            if time_field(ui, &mut b, dur, "Out ", "End. Type h:m:s.ms, or press O.") {
+                self.set_out(b);
+            }
+            let mut len = b - a;
+            let hint = "Selection length. Type h:m:s.ms to move the end.";
+            if time_field(ui, &mut len, dur - a, format!("{} ", icon::SCISSORS), hint) {
+                self.set_out(a + len);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(job) = &self.job {
@@ -737,20 +801,9 @@ impl App {
                 if icon_button(ui, icon::CROP, "Crop (C)", self.crop.is_some()).clicked() {
                     self.toggle_crop();
                 }
-                ui.separator();
-                ui.label(
-                    RichText::new(format!(
-                        "{} {}",
-                        icon::SCISSORS,
-                        fmt_time(self.trim.1 - self.trim.0)
-                    ))
-                    .monospace(),
-                )
-                .on_hover_text("Selection length. Set in/out with I and O.");
-                ui.label(RichText::new(fmt_time(self.pos())).monospace().strong());
-                self.trim_bar(ui);
             });
         });
+        self.trim_bar(ui);
     }
 
     /// Filmstrip with Quick Look–style yellow trim handles and a playhead.
@@ -866,5 +919,23 @@ impl App {
         let ph = x(self.pos());
         p.vline(ph, r.y_range(), Stroke::new(2.0, Color32::WHITE));
         p.circle_filled(pos2(ph, r.min.y + 2.0), 3.0, Color32::WHITE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_round_trip() {
+        assert_eq!(fmt_time(0.0), "0:00.000");
+        assert_eq!(fmt_time(59.9996), "1:00.000");
+        assert_eq!(fmt_time(3723.0456), "1:02:03.046");
+        assert_eq!(parse_time("1:02:03.046"), Some(3723.046));
+        assert_eq!(parse_time(" 2:05.5 "), Some(125.5));
+        assert_eq!(parse_time("90.25"), Some(90.25));
+        for bad in ["", "x", "1:2:3:4", "nan", "-1", "1::2"] {
+            assert_eq!(parse_time(bad), None, "{bad}");
+        }
     }
 }
