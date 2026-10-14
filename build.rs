@@ -16,6 +16,7 @@ fn main() {
         println!("cargo:rustc-link-search=native=/usr/local/lib");
     }
     if os.as_deref() == Ok("windows") {
+        icon();
         // libmpv from MPV_LIB_DIR (needed to link anyway), ffmpeg from PATH.
         let mpv = std::env::var_os("MPV_LIB_DIR").map(|d| Path::new(&d).join("libmpv-2.dll"));
         let ffmpeg = std::env::var_os("PATH").and_then(|p| {
@@ -29,6 +30,31 @@ fn main() {
                 "cargo:warning=libmpv-2.dll (MPV_LIB_DIR) or ffmpeg.exe (PATH) not found; qpe.exe will need them next to it"
             ),
         }
+    }
+}
+
+/// Explorer/shortcut icon: compile assets/qpe.ico into a resource with rc.exe (MSVC dev env) and link it.
+fn icon() {
+    println!("cargo:rerun-if-changed=assets/qpe.ico");
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let ico = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/qpe.ico");
+    let (rc, res) = (out.join("qpe.rc"), out.join("qpe.res"));
+    std::fs::write(
+        &rc,
+        format!(
+            "1 ICON \"{}\"\n",
+            ico.display().to_string().replace('\\', "\\\\")
+        ),
+    )
+    .unwrap();
+    match std::process::Command::new("rc.exe")
+        .args(["/nologo", "/fo"])
+        .arg(&res)
+        .arg(&rc)
+        .status()
+    {
+        Ok(s) if s.success() => println!("cargo:rustc-link-arg-bins={}", res.display()),
+        _ => println!("cargo:warning=rc.exe failed or not on PATH; qpe.exe will have no icon"),
     }
 }
 

@@ -23,6 +23,10 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("QPE")
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/qpe.png"))
+                    .expect("assets/qpe.png is a valid PNG"),
+            )
             .with_inner_size([960.0, 600.0])
             .with_min_inner_size([520.0, 320.0])
             .with_drag_and_drop(true),
